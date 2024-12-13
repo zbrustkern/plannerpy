@@ -1,0 +1,7 @@
+{
+  "projects": {
+    "default": "planner-cac2a",
+    "staging": "planner-cac2a",
+    "production": "tophat-financial"
+  }
+}
