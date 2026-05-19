@@ -12,6 +12,7 @@ cors = CorsOptions(
 )
 
 # Generic Plan CRUD operations
+# Commenting to test push
 
 @https_fn.on_call()
 def create_plan(req: https_fn.CallableRequest) -> dict:
@@ -39,6 +40,12 @@ def create_plan(req: https_fn.CallableRequest) -> dict:
     try:
         doc_ref = firestore_client.collection(f'users/{uid}/plans').document()
         doc_ref.set(plan_data)
+        
+        # Save plan-specific details to subcollection
+        if 'details' in data:
+            details_ref = doc_ref.collection('details').document('main')
+            details_ref.set(data['details'])
+
         return {'success': True, 'message': 'Plan created successfully.', 'planId': doc_ref.id}
     except Exception as e:
         print(f"Error creating plan: {str(e)}")
