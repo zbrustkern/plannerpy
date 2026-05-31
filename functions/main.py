@@ -176,11 +176,16 @@ def list_plans(req: https_fn.CallableRequest) -> dict:
             if last_updated and hasattr(last_updated, 'isoformat'):
                 last_updated = last_updated.isoformat()
             
+            # Fetch details subcollection
+            details_ref = firestore_client.collection(f'users/{uid}/plans/{plan.id}/details').document('main')
+            details_doc = details_ref.get()
+            details_data = details_doc.to_dict() if details_doc.exists else {}
+
             plans_list.append({
                 'id': plan.id,
                 'planName': plan_dict.get('planName'),
                 'planType': plan_dict.get('planType'),
-                'formData': plan_dict.get('formData', {}),
+                'details': details_data,
                 'lastUpdated': last_updated
             })
         return {'success': True, 'plans': plans_list}
