@@ -193,3 +193,86 @@ def list_plans(req: https_fn.CallableRequest) -> dict:
         print(f"Error listing plans: {str(e)}")
         raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INTERNAL,
                                   message='Error listing plans.')
+import requests
+import datetime
+from firebase_functions import scheduler_fn
+
+def fetch_yahoo_price(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            return data.get('chart', {}).get('result', [{}])[0].get('meta', {}).get('regularMarketPrice')
+    except Exception as e:
+        print(f"Error fetching price for {symbol}: {e}")
+    return None
+
+def _take_snapshot_for_plan(uid, plan_id, plan_dict, details_data, firestore_client):
+    try:
+        if plan_dict.get('planType') == 'rebalance' and 'assets' in details_data:
+            updated_assets = []
+            for asset in details_data.get('assets', []):
+                if asset.get('type') == 'equity' and asset.get('symbol'):
+                    price = fetch_yahoo_price(asset['symbol'])
+                    if price is not None:
+                        asset['price'] = price
+                updated_assets.append(asset)
+            details_data['assets'] = updated_assets
+
+        today_str = datetime.datetime.now().strftime('%Y-%m-%d')
+        snapshot_ref = firestore_client.collection(f'users/{uid}/plans/{plan_id}/history').document(today_str)
+        snapshot_ref.set({
+            'timestamp': firestore.SERVER_TIMESTAMP,
+            'planType': plan_dict.get('planType'),
+            'details': details_data
+        })
+        return True
+    except Exception as e:
+        print(f"Failed to snapshot plan {plan_id}: {e}")
+        return False
+
+@https_fn.on_call()
+def take_snapshot(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+                                  message='User must be authenticated.')
+    uid = req.auth.uid
+    data = req.data
+    plan_id = data.get('planId')
+    if not plan_id:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                                  message='planId is required.')
+
+    firestore_client = firestore.client()
+    try:
+        doc_ref = firestore_client.collection(f'users/{uid}/plans').document(plan_id)
+        doc = doc_ref.get()
+        if not doc.exists:
+            return {'success': False, 'message': 'Plan not found.'}
+        
+        details_doc = doc_ref.collection('details').document('main').get()
+        details_data = details_doc.to_dict() if details_doc.exists else {}
+
+        _take_snapshot_for_plan(uid, plan_id, doc.to_dict(), details_data, firestore_client)
+        return {'success': True, 'message': 'Snapshot taken successfully.'}
+    except Exception as e:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INTERNAL,
+                                  message=str(e))
+
+@scheduler_fn.on_schedule(schedule="0 0 1 * *")
+def monthly_snapshot(event: scheduler_fn.ScheduledEvent) -> None:
+    firestore_client = firestore.client()
+    users_ref = firestore_client.collection('users')
+    
+    for user_doc in users_ref.stream():
+        uid = user_doc.id
+        plans = firestore_client.collection(f'users/{uid}/plans').stream()
+        for plan in plans:
+            try:
+                details_doc = firestore_client.collection(f'users/{uid}/plans/{plan.id}/details').document('main').get()
+                details_data = details_doc.to_dict() if details_doc.exists else {}
+                _take_snapshot_for_plan(uid, plan.id, plan.to_dict(), details_data, firestore_client)
+            except Exception as e:
+                print(f"Error processing plan {plan.id} for user {uid}: {e}")
