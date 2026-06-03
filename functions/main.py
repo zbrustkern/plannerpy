@@ -209,6 +209,23 @@ def fetch_yahoo_price(symbol):
         print(f"Error fetching price for {symbol}: {e}")
     return None
 
+@https_fn.on_call()
+def fetch_quote(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+                                  message='User must be authenticated.')
+    data = req.data
+    symbol = data.get('symbol')
+    if not symbol:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                                  message='symbol is required.')
+    
+    price = fetch_yahoo_price(symbol)
+    if price is None:
+        return {'success': False, 'message': 'Failed to fetch price.'}
+    
+    return {'success': True, 'price': price}
+
 def _take_snapshot_for_plan(uid, plan_id, plan_dict, details_data, firestore_client):
     try:
         if plan_dict.get('planType') == 'rebalance' and 'assets' in details_data:
