@@ -293,3 +293,38 @@ def monthly_snapshot(event: scheduler_fn.ScheduledEvent) -> None:
                 _take_snapshot_for_plan(uid, plan.id, plan.to_dict(), details_data, firestore_client)
             except Exception as e:
                 print(f"Error processing plan {plan.id} for user {uid}: {e}")
+
+@https_fn.on_call()
+def fetch_option_chain(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+                                  message='User must be authenticated.')
+    data = req.data
+    symbol = data.get('symbol')
+    if not symbol:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+                                  message='symbol is required.')
+    
+    import yfinance as yf
+    import json
+    try:
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations:
+            return {'success': False, 'message': 'No options found.'}
+        
+        # We'll just return the first 3 expirations and their puts
+        results = []
+        for exp in expirations[:3]:
+            opt = ticker.option_chain(exp)
+            # convert to json dicts, replace NaN with None
+            puts = opt.puts.replace({float('nan'): None}).to_dict(orient='records')
+            results.append({
+                'expiration': exp,
+                'puts': puts
+            })
+            
+        return {'success': True, 'expirations': results, 'currentPrice': fetch_yahoo_price(symbol)}
+    except Exception as e:
+        print(f"Error fetching options for {symbol}: {e}")
+        return {'success': False, 'message': str(e)}
