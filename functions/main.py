@@ -295,6 +295,34 @@ def monthly_snapshot(event: scheduler_fn.ScheduledEvent) -> None:
                 print(f"Error processing plan {plan.id} for user {uid}: {e}")
 
 @https_fn.on_call()
+def fetch_historical_prices(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+                                  message='User must be authenticated.')
+    data = req.data
+    symbols = data.get('symbols', [])
+    start_date = data.get('startDate')
+
+    if not symbols or not start_date:
+        return {'success': False, 'message': 'symbols and startDate are required.'}
+
+    import yfinance as yf
+    try:
+        results = {}
+        for symbol in symbols:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(start=start_date, interval="1mo")
+            for date, row in hist.iterrows():
+                date_str = date.strftime('%Y-%m-%d')
+                if date_str not in results:
+                    results[date_str] = {}
+                results[date_str][symbol] = float(row['Close'])
+        return {'success': True, 'prices': results}
+    except Exception as e:
+        print(f"Error fetching historical prices: {str(e)}")
+        return {'success': False, 'message': str(e)}
+
+@https_fn.on_call()
 def fetch_option_chain(req: https_fn.CallableRequest) -> dict:
     if not req.auth:
         raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
