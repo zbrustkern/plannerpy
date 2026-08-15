@@ -1,5 +1,5 @@
-from firebase_functions import https_fn
-from firebase_admin import initialize_app, firestore
+from firebase_functions import https_fn, scheduler_fn
+from firebase_admin import initialize_app, firestore, auth as firebase_auth
 import google.cloud.firestore
 from firebase_functions.options import CorsOptions
 
@@ -356,3 +356,159 @@ def fetch_option_chain(req: https_fn.CallableRequest) -> dict:
     except Exception as e:
         print(f"Error fetching options for {symbol}: {e}")
         return {'success': False, 'message': str(e)}
+
+# --- ADMIN & LICENSING FUNCTIONS ---
+
+@https_fn.on_call()
+def list_admin_users(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+                                  message='User must be authenticated.')
+    
+    # Check if caller has admin role custom claim or is in admin whitelist
+    caller_role = req.auth.token.get('role')
+    caller_email = req.auth.token.get('email', '')
+    admin_emails = ['sentral@gmail.com', 'zeke@tophatfinancial.com']
+    
+    if caller_role != 'admin' and caller_email not in admin_emails:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+                                  message='Administrative access required.')
+
+    firestore_client = firestore.client()
+
+    try:
+        users_list = []
+        page = firebase_auth.list_users()
+        
+        while page:
+            for user in page.users:
+                uid = user.uid
+                email = user.email or 'No Email'
+                custom_claims = user.custom_claims or {}
+                user_role = custom_claims.get('role', 'free')
+                
+                # If email is in admin whitelist, force admin display
+                if email in admin_emails:
+                    user_role = 'admin'
+                
+                # Check user plan count in Firestore
+                plans_count = 0
+                try:
+                    plans_stream = firestore_client.collection(f'users/{uid}/plans').stream()
+                    plans_count = len(list(plans_stream))
+                except Exception:
+                    pass
+                
+                # Creation / last sign in dates
+                creation_time = user.user_metadata.creation_timestamp
+                last_sign_in = user.user_metadata.last_sign_in_timestamp
+                
+                from datetime import datetime
+                joined_date = datetime.fromtimestamp(creation_time / 1000.0).strftime('%Y-%m-%d') if creation_time else 'Unknown'
+                last_active = datetime.fromtimestamp(last_sign_in / 1000.0).strftime('%Y-%m-%d') if last_sign_in else 'Never'
+
+                users_list.append({
+                    'id': uid,
+                    'email': email,
+                    'role': user_role,
+                    'joinedDate': joined_date,
+                    'lastActive': last_active,
+                    'plansCount': plans_count
+                })
+            
+            page = page.get_next_page()
+
+        return {'success': True, 'users': users_list}
+    except Exception as e:
+        print(f"Error listing admin users: {str(e)}")
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INTERNAL, message=str(e))
+
+
+@https_fn.on_call()
+def update_user_role(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED, message='Unauthenticated.')
+    
+    caller_role = req.auth.token.get('role')
+    caller_email = req.auth.token.get('email', '')
+    admin_emails = ['sentral@gmail.com', 'zeke@tophatfinancial.com']
+    
+    if caller_role != 'admin' and caller_email not in admin_emails:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.PERMISSION_DENIED, message='Admin required.')
+
+    data = req.data or {}
+    target_uid = data.get('userId')
+    new_role = data.get('role')
+
+    if not target_uid or not new_role or new_role not in ['free', 'paid', 'admin']:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT, message='Invalid uid or role.')
+
+    try:
+        # Set custom claim in Firebase Auth
+        firebase_auth.set_custom_user_claims(target_uid, {'role': new_role})
+        
+        # Also update user document in Firestore
+        firestore_client = firestore.client()
+        user_ref = firestore_client.collection('users').document(target_uid)
+        user_ref.set({'role': new_role, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
+
+        return {'success': True, 'message': f'Role for user {target_uid} updated to {new_role}.'}
+    except Exception as e:
+        print(f"Error updating user role: {str(e)}")
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INTERNAL, message=str(e))
+
+
+@https_fn.on_call()
+def redeem_license_code(req: https_fn.CallableRequest) -> dict:
+    if not req.auth:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.UNAUTHENTICATED, message='User must be signed in.')
+
+    uid = req.auth.uid
+    email = req.auth.token.get('email', '')
+    data = req.data or {}
+    raw_code = (data.get('code') or '').strip().upper()
+
+    if not raw_code:
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT, message='License code is required.')
+
+    firestore_client = firestore.client()
+    key_ref = firestore_client.collection('license_keys').document(raw_code)
+
+    try:
+        doc = key_ref.get()
+        if not doc.exists:
+            # Check demo / master promo keys
+            if raw_code.startswith('TOPHAT-PRO') or raw_code.startswith('DECO-2026') or raw_code == 'TOPHAT-PRO-2026':
+                role_to_grant = 'paid'
+            else:
+                return {'success': False, 'message': 'Invalid license or promo code.'}
+        else:
+            key_data = doc.to_dict() or {}
+            if key_data.get('isUsed'):
+                return {'success': False, 'message': 'This code has already been redeemed.'}
+            role_to_grant = key_data.get('roleGranted', 'paid')
+
+            # Mark key as used
+            key_ref.update({
+                'isUsed': True,
+                'usedBy': uid,
+                'usedByEmail': email,
+                'usedAt': firestore.SERVER_TIMESTAMP
+            })
+
+        # Grant claim to user
+        firebase_auth.set_custom_user_claims(uid, {'role': role_to_grant})
+
+        # Update Firestore user document
+        user_ref = firestore_client.collection('users').document(uid)
+        user_ref.set({'role': role_to_grant, 'redeemedCode': raw_code, 'lastUpdated': firestore.SERVER_TIMESTAMP}, merge=True)
+
+        return {
+            'success': True, 
+            'message': f'Congratulations! Code redeemed successfully. Pro features unlocked.', 
+            'roleGranted': role_to_grant
+        }
+    except Exception as e:
+        print(f"Error redeeming license code: {str(e)}")
+        raise https_fn.HttpsError(code=https_fn.FunctionsErrorCode.INTERNAL, message=str(e))
+

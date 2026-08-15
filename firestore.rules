@@ -8,9 +8,14 @@ service cloud.firestore {
       return request.auth != null;
     }
 
-    // Ensure the document belongs to the authenticated user
+    // Check for Google Auth Custom Claim 'admin'
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.role == 'admin';
+    }
+
+    // Ensure the document belongs to the authenticated user OR an admin
     function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+      return isAuthenticated() && (request.auth.uid == userId || isAdmin());
     }
 
     // Plans Collection: Document must have a userId field matching the auth.uid
@@ -28,6 +33,11 @@ service cloud.firestore {
     match /tracking_history/{docId} {
       allow read, update, delete: if isOwner(resource.data.userId);
       allow create: if isOwner(request.resource.data.userId);
+    }
+
+    // Admin Keys Collection: Strictly restricted to Admin role
+    match /admin_keys/{keyId} {
+      allow read, write: if isAdmin();
     }
   }
 }
